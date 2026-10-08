@@ -16,6 +16,9 @@ from __future__ import annotations
 """Request scheduler policy"""
 
 import os
+import logging
+import math
+import time
 import random
 from collections import defaultdict
 from contextlib import contextmanager
@@ -64,6 +67,7 @@ class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
     LPM = "lpm"  # longest prefix match
+    LPM_AGING = "lpm-aging"  # cache reuse with waiting-time compensation
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
 
 
@@ -91,6 +95,14 @@ class SchedulePolicy:
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
+        self.lpm_max_wait_s = float(os.environ.get("SGLANG_LPM_MAX_WAIT_MS", "1000")) / 1000
+        if not math.isfinite(self.lpm_max_wait_s) or self.lpm_max_wait_s <= 0:
+            raise ValueError("SGLANG_LPM_MAX_WAIT_MS must be finite and positive")
+        self._aging_trigger_logged = False
+        if self.policy == CacheAwarePolicy.LPM_AGING:
+            logging.getLogger(__name__).info(
+                "Experimental LPM aging enabled: max_wait_ms=%g", self.lpm_max_wait_s * 1000
+            )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
@@ -120,6 +132,24 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_longest_prefix(
                     waiting_queue, temporary_deprioritized
                 )
+            elif policy == CacheAwarePolicy.LPM_AGING:
+                now = time.perf_counter()
+                overdue = {
+                    r.rid for r in waiting_queue
+                    if now - r.time_stats.wait_queue_entry_time >= self.lpm_max_wait_s
+                }
+                if overdue and not self._aging_trigger_logged:
+                    logging.getLogger(__name__).info(
+                        "LPM aging threshold reached: queued_overdue=%d", len(overdue)
+                    )
+                    self._aging_trigger_logged = True
+                # Expired requests compete in arrival order. Others retain LPM,
+                # including the existing in-batch duplicate deprioritization.
+                waiting_queue.sort(key=lambda r: (
+                    (0, r.time_stats.wait_queue_entry_time) if r.rid in overdue else
+                    (2, 0) if r.rid in temporary_deprioritized else
+                    (1, -len(r.prefix_indices))
+                ))
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
             else:
@@ -140,7 +170,7 @@ class SchedulePolicy:
         return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
-        if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
+        if self.policy in (CacheAwarePolicy.LPM, CacheAwarePolicy.LPM_AGING) and len(waiting_queue) > 128:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy

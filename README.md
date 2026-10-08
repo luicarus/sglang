@@ -1,3 +1,7 @@
+> This is the QuantAssay scheduler research branch, based on SGLang v0.5.3.
+> Its default scheduler uses waiting-aware LPM. See [branch details](QUANTASSAY.md)
+> and the [QuantAssay evaluation project](https://github.com/luicarus/QuantAssay).
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
