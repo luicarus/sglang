@@ -1969,6 +1969,16 @@ class Scheduler(
                         req.time_stats.get_queueing_time(),
                     )
 
+        if self.server_args.trace_prefill_budgets:
+            # These properties combine allocator state with admission offsets.
+            # Capture before allocation; reading them after prepare_for_extend
+            # would subtract this batch's tokens a second time in the log.
+            context["admission_kv_budget"] = {
+                "reserved_remaining_tokens": adder.rem_total_tokens,
+                "current_remaining_tokens": adder.cur_rem_tokens,
+                "sample_moment": "before_native_batch_allocation",
+            }
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,

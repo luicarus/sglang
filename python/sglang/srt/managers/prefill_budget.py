@@ -67,19 +67,24 @@ def emit_event(scheduler, context, status, *, reason=None, adder=None,
     if status == "blocked":
         # Suppress repeated decode-loop attempts with an unchanged block state.
         signature = (reason, context["running_batch_size"], context["waiting_reqs"],
-                     context["chunk_request_id"])
+                     context["chunk_request_id"], tuple(context["candidate_request_ids"]),
+                     context["gross_chunk_budget_tokens"])
         if signature == getattr(scheduler, "_qa_last_prefill_block", None):
             return
         scheduler._qa_last_prefill_block = signature
     else:
         scheduler._qa_last_prefill_block = None
+    admission_budget = context.get("admission_kv_budget")
+    if admission_budget is None and adder is not None:
+        admission_budget = {"reserved_remaining_tokens": adder.rem_total_tokens,
+                            "current_remaining_tokens": adder.cur_rem_tokens,
+                            "sample_moment": "admission_stop_before_native_batch_allocation"}
     event = {
         **context, "status": status, "stop_reason": reason,
         "request_ids": request_ids or [], "logical_prefill_tokens": logical_tokens,
         "mixed_decode_reqs": mixed_decode_reqs,
         "charged_prefill_tokens": adder.log_input_tokens if adder is not None else None,
-        "reserved_kv_budget_remaining_tokens": adder.rem_total_tokens if adder is not None else None,
-        "current_kv_budget_remaining_tokens": adder.cur_rem_tokens if adder is not None else None,
+        "admission_kv_budget": admission_budget,
         "kv_after": kv_snapshot(scheduler),
         "server_monotonic_seconds": time.perf_counter(),
         "clock_id": time.get_clock_info("perf_counter").implementation,
