@@ -375,6 +375,7 @@ class PrefillAdder:
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.stop_reason = None
 
         if running_batch is not None:
             self.rem_total_token_offset += sum(
@@ -439,14 +440,19 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
-        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+        if self.rem_total_tokens <= 0:
+            self.stop_reason = "kv_total_reservation_budget"
             return AddReqResult.NO_TOKEN
-
-        if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
-        ):
+        if self.cur_rem_tokens <= 0:
+            self.stop_reason = "kv_current_budget"
+            return AddReqResult.NO_TOKEN
+        if self.rem_input_tokens <= 0:
+            self.stop_reason = "input_token_budget"
             return AddReqResult.OTHER
-
+        if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
+            self.stop_reason = "chunk_token_budget"
+            return AddReqResult.OTHER
+        self.stop_reason = None
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
@@ -503,6 +509,7 @@ class PrefillAdder:
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
         ):
+            self.stop_reason = "request_kv_budget_ignore_eos"
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -551,6 +558,7 @@ class PrefillAdder:
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
                 # reserve tokens for corner cases
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                    self.stop_reason = "decode_reservation_ignore_eos"
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
@@ -567,6 +575,7 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens == 0:
+                self.stop_reason = "chunk_token_budget"
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -583,6 +592,7 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        self.stop_reason = None
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -596,14 +606,17 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            self.stop_reason = "request_kv_reservation_budget"
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            self.stop_reason = "input_token_budget"
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                self.stop_reason = "locked_prefix_kv_reservation_budget"
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
@@ -618,6 +631,7 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                self.stop_reason = "input_token_budget"
                 return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
@@ -640,6 +654,7 @@ class PrefillAdder:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
                 if trunc_len <= 0:
+                    self.stop_reason = "chunk_page_budget"
                     return AddReqResult.OTHER
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
@@ -647,6 +662,7 @@ class PrefillAdder:
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
+                        self.stop_reason = "truncation_alignment_budget"
                         return AddReqResult.OTHER
                     else:
                         trunc_len = truncation_align_size * (

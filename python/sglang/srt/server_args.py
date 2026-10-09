@@ -189,6 +189,10 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
+    adaptive_prefill: bool = False
+    adaptive_prefill_min_tokens: int = 128
+    adaptive_prefill_mid_tokens: int = 256
+    trace_prefill_budgets: bool = False
     schedule_policy: str = "lpm-aging"
     enable_priority_scheduling: bool = False
     schedule_low_priority_values_first: bool = False
@@ -1506,6 +1510,12 @@ class ServerArgs:
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
         )
+        parser.add_argument("--adaptive-prefill", action="store_true",
+                            help="Experimental decode-pressure chunk budget; default off.")
+        parser.add_argument("--adaptive-prefill-min-tokens", type=int, default=128)
+        parser.add_argument("--adaptive-prefill-mid-tokens", type=int, default=256)
+        parser.add_argument("--trace-prefill-budgets", action="store_true",
+                            help="Log prepared prefill budgets and native KV observations.")
         parser.add_argument(
             "--schedule-policy",
             type=str,
@@ -2934,6 +2944,15 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
+        if self.adaptive_prefill:
+            if not self.enable_mixed_chunk or self.chunked_prefill_size <= 0:
+                raise ValueError("adaptive prefill requires mixed chunked prefill")
+            if self.pp_size != 1 or self.disaggregation_mode != "null":
+                raise ValueError("adaptive prefill currently supports non-disaggregated PP=1 serving")
+            if not 0 < self.adaptive_prefill_min_tokens <= self.adaptive_prefill_mid_tokens <= self.chunked_prefill_size:
+                raise ValueError("adaptive prefill budgets must satisfy 0 < min <= mid <= chunk ceiling")
+            if self.adaptive_prefill_min_tokens % self.page_size or self.adaptive_prefill_mid_tokens % self.page_size:
+                raise ValueError("adaptive prefill budgets must be page aligned")
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":

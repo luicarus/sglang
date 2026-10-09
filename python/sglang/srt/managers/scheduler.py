@@ -35,6 +35,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.managers.prefill_budget import budget_context, emit_event
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -1820,6 +1821,9 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if self.waiting_queue and self.server_args.trace_prefill_budgets:
+                context = budget_context(self, len(self.running_batch.reqs))
+                emit_event(self, context, "blocked", reason="native_batch_full")
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1834,6 +1838,9 @@ class Scheduler(
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
+            if self.server_args.trace_prefill_budgets:
+                context = budget_context(self, running_bs)
+                emit_event(self, context, "blocked", reason="request_slot_budget")
             return None
 
         if self.enable_hierarchical_cache:
@@ -1843,6 +1850,12 @@ class Scheduler(
         self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
+        context = (budget_context(self, running_bs)
+                   if self.server_args.adaptive_prefill or self.server_args.trace_prefill_budgets
+                   else None)
+        if self.server_args.adaptive_prefill and context["net_chunk_budget_tokens"] < self.page_size:
+            emit_event(self, context, "blocked", reason="chunk_budget_reserved_by_decode")
+            return None
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -1850,10 +1863,11 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            context["gross_chunk_budget_tokens"] if context else self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
+        scheduler_stop_reason = None
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -1871,6 +1885,7 @@ class Scheduler(
                 | set([req.lora_id])
             ):
                 self.running_batch.batch_is_full = True
+                scheduler_stop_reason = "lora_batch_limit"
                 break
 
             running_bs = len(self.running_batch.reqs) - len(adder.preempt_list)
@@ -1884,8 +1899,10 @@ class Scheduler(
 
             if self.running_batch.batch_is_full:
                 if not self.try_preemption:
+                    scheduler_stop_reason = "request_slot_budget"
                     break
                 if not adder.preempt_to_schedule(req, self.server_args):
+                    scheduler_stop_reason = "preemption_not_feasible"
                     break
 
             if self.enable_hicache_storage:
@@ -1915,6 +1932,9 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            emit_event(self, context, "blocked",
+                       reason=scheduler_stop_reason or adder.stop_reason or "no_prefill_candidate_ready",
+                       adder=adder)
             return None
 
         if self.enable_metrics:
@@ -1967,6 +1987,12 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        logical_prefill_tokens = (sum(req.extend_input_len for req in can_run_list)
+                                 if self.server_args.trace_prefill_budgets else None)
+        # mix_with_running extends the same request list in place. Capture
+        # Prefill IDs before it adds the Decode requests.
+        prefill_request_ids = ([req.rid for req in can_run_list]
+                               if self.server_args.trace_prefill_budgets else None)
 
         # Mixed-style chunked prefill
         if (
@@ -1986,6 +2012,11 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        emit_event(self, context, "prepared", adder=adder,
+                   reason=scheduler_stop_reason or adder.stop_reason,
+                   request_ids=prefill_request_ids,
+                   logical_tokens=logical_prefill_tokens,
+                   mixed_decode_reqs=len(new_batch.decoding_reqs or []))
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
