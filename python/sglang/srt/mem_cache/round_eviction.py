@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 def queued_demands(scheduler):
     args = scheduler.server_args
     reserved = len(scheduler.running_batch.reqs) if scheduler.is_mixed_chunk else 0
-    budget = max(scheduler.page_size, (scheduler.chunked_prefill_size - reserved)
-                 // scheduler.page_size * scheduler.page_size)
+    budget = (scheduler.chunked_prefill_size - reserved) // scheduler.page_size * scheduler.page_size
+    if budget <= 0:
+        return []
     return [{"rid": r.rid, "tokens": list(r.origin_input_ids) + list(r.output_ids),
              "extra_key": r.extra_key, "budget": budget}
             for r in scheduler.waiting_queue if not r.finished()][:args.kv_eviction_lookahead]
@@ -81,7 +82,7 @@ def evict(cache, requested):
             index = min(range(len(candidates)), key=lambda i: (
                 costs[i][0] / len(candidates[i][1].value),
                 costs[i][1] / len(candidates[i][1].value),
-                candidates[i][0], candidates[i][1].id))
+                candidates[i][0]))
         _, node = candidates.pop(index)
         for entry in candidates:
             heapq.heappush(heap, entry)
