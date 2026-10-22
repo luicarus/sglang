@@ -806,6 +806,15 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
 
+        if server_args.kv_eviction_mode != "native" or server_args.trace_kv_evictions:
+            if type(self.tree_cache) is not RadixCache:
+                raise ValueError("round eviction currently supports the Python full-attention RadixCache only")
+            from sglang.srt.mem_cache.round_eviction import queued_demands
+            self.tree_cache.round_demand_provider = lambda: queued_demands(self)
+            self.tree_cache.round_eviction_mode = server_args.kv_eviction_mode
+            self.tree_cache.round_candidate_limit = server_args.kv_eviction_candidates
+            self.tree_cache.trace_round_eviction = server_args.trace_kv_evictions
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache

@@ -193,6 +193,10 @@ class ServerArgs:
     adaptive_prefill_min_tokens: int = 128
     adaptive_prefill_mid_tokens: int = 256
     trace_prefill_budgets: bool = False
+    kv_eviction_mode: str = "native"
+    kv_eviction_candidates: int = 32
+    kv_eviction_lookahead: int = 16
+    trace_kv_evictions: bool = False
     schedule_policy: str = "lpm-aging"
     enable_priority_scheduling: bool = False
     schedule_low_priority_values_first: bool = False
@@ -1513,6 +1517,10 @@ class ServerArgs:
         parser.add_argument("--adaptive-prefill", action="store_true",
                             help="Experimental decode-pressure chunk budget; default off.")
         parser.add_argument("--adaptive-prefill-min-tokens", type=int, default=128)
+        parser.add_argument("--kv-eviction-mode", choices=("native", "prefill-rounds"), default="native")
+        parser.add_argument("--kv-eviction-candidates", type=int, default=32)
+        parser.add_argument("--kv-eviction-lookahead", type=int, default=16)
+        parser.add_argument("--trace-kv-evictions", action="store_true")
         parser.add_argument("--adaptive-prefill-mid-tokens", type=int, default=256)
         parser.add_argument("--trace-prefill-budgets", action="store_true",
                             help="Log prepared prefill budgets and native KV observations.")
@@ -2944,6 +2952,14 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
+        if self.kv_eviction_mode != "native" or self.trace_kv_evictions:
+            if (self.adaptive_prefill or self.chunked_prefill_size <= 0
+                    or self.radix_eviction_policy != "lru" or self.disable_radix_cache
+                    or self.speculative_algorithm is not None or self.pp_size != 1
+                    or self.disaggregation_mode != "null"):
+                raise ValueError("round eviction requires fixed chunks, LRU and ordinary non-speculative PP=1 serving")
+            if min(self.kv_eviction_candidates, self.kv_eviction_lookahead) < 1:
+                raise ValueError("round eviction limits must be positive")
         if self.adaptive_prefill:
             if not self.enable_mixed_chunk or self.chunked_prefill_size <= 0:
                 raise ValueError("adaptive prefill requires mixed chunked prefill")

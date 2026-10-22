@@ -449,6 +449,10 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        if getattr(self, "round_demand_provider", None) is not None:
+            from sglang.srt.mem_cache.round_eviction import evict
+            return evict(self, num_tokens)
+
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
